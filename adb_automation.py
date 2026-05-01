@@ -24,10 +24,10 @@ CLOSE_BUTTON = "tpl_close.png"
 
 
 class AccountType(str, Enum):
-    QQ = "qq"
-    WX = "wx"
-    BOTH = "both"
-    NONE = "none"
+    QQ = "qq available"
+    WX = "wx available"
+    BOTH = "both available"
+    NONE = "none available"
 
 
 def parse_device_uri(uri: str):
@@ -320,7 +320,17 @@ def main():
             cards = match_all(
                 screen, templ["add_friend_icon"], args.threshold, min_distance=50
             )
-            # 只有识别到 1 个结果卡片时才继续；0 个或 2 个及以上都跳过。
+
+            if len(cards) == 0:
+                update_type(db_path, row_id, AccountType.BOTH)
+                print(f"{game_id}: 双区可用")
+                continue
+
+            if len(cards) == 2:
+                update_type(db_path, row_id, AccountType.NONE)
+                print(f"{game_id}: 两个区都不可用")
+                continue
+
             if len(cards) != 1:
                 print(f"skip {game_id}: result cards={len(cards)}")
                 continue
@@ -337,10 +347,15 @@ def main():
                 continue
             adb.tap(hit_info[0], hit_info[1])
             time.sleep(2.0)
-            # 6.如果有qq名片就是qq区，不然就是微信区
+            # 6. 检测到 QQ 标记时按需求判断为“微信可用”，否则“QQ可用”。
             profile = adb.screenshot()
             qq = match_best(profile, templ["qq_mark"], args.threshold)
-            update_type(db_path, row_id, AccountType.QQ if qq else AccountType.WX)
+            if qq:
+                update_type(db_path, row_id, AccountType.WX)
+                print(f"{game_id}: 微信可用")
+            else:
+                update_type(db_path, row_id, AccountType.QQ)
+                print(f"{game_id}: QQ可用")
 
             hit_close, _ = wait_template(
                 adb, templ["close"], threshold=args.threshold, timeout=5
