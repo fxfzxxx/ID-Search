@@ -11,7 +11,6 @@ from enum import Enum
 import cv2
 import numpy as np
 
-
 DB_NAME = "input.db"
 
 SEARCH_INPUT = "tpl_shu_ru.png"
@@ -95,13 +94,25 @@ class AdbClient:
         return self._ime_cache
 
     def has_unicode_bridge(self):
-        # Common ADB keyboard identifiers.
-        markers = ("adbkeyboard", "adb_ime", "adbime")
+        return self.get_unicode_bridge() is not None
+
+    def get_unicode_bridge(self):
+        # Prefer Yosemite on customer devices; keep ADBKeyboard as fallback.
         for ime in self.list_imes():
             low = ime.lower()
-            if any(m in low for m in markers):
-                return True
-        return False
+            if "yosemite" in low:
+                return {
+                    "action": "ADB_INPUT_TEXT",
+                    "package": "com.netease.nie.yosemite",
+                    "use_b64": False,
+                }
+            if any(m in low for m in ("adbkeyboard", "adb_ime", "adbime")):
+                return {
+                    "action": "ADB_INPUT_B64",
+                    "package": "com.android.adbkeyboard",
+                    "use_b64": True,
+                }
+        return None
 
     def text(self, value: str):
         value = str(value)
@@ -109,17 +120,22 @@ class AdbClient:
             return
 
         # Only use broadcast input when a known unicode-capable bridge exists.
-        if self.has_unicode_bridge():
-            payload = base64.b64encode(value.encode("utf-8")).decode("ascii")
+        bridge = self.get_unicode_bridge()
+        if bridge:
+            payload = (
+                base64.b64encode(value.encode("utf-8")).decode("ascii")
+                if bridge["use_b64"]
+                else value
+            )
             p = self.run(
                 [
                     "shell",
                     "am",
                     "broadcast",
                     "-a",
-                    "ADB_INPUT_B64",
+                    bridge["action"],
                     "-p",
-                    "com.android.adbkeyboard",
+                    bridge["package"],
                     "--es",
                     "msg",
                     payload,
@@ -127,7 +143,12 @@ class AdbClient:
                 check=False,
             )
             out = (p.stdout + p.stderr).decode("utf-8", errors="ignore")
-            if p.returncode == 0 and "Broadcast" in out and "Exception" not in out:
+            if (
+                p.returncode == 0
+                and "Broadcast" in out
+                and "Exception" not in out
+                and "Error" not in out
+            ):
                 return
 
         # Fallback for ASCII text only.
