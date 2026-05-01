@@ -17,4 +17,3 @@ venv/
 # Runtime/log outputs
 single_logs/
 *.log
-input.db
