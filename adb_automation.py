@@ -15,7 +15,8 @@ DB_NAME = "input.db"
 
 SEARCH_INPUT = "tpl_shu_ru.png"
 SEARCH_BUTTON = "tpl_search_btn.png"
-QQ_MARK = "tpl_qq_ming_pian.png"
+QQ_MARK_1 = "tpl_qq_ming_pian.png"
+QQ_MARK_2 = "tpl_qq_da_zhao_hu.png"
 ADD_FRIEND_ICON = "tpl_add_friend.png"
 INFO_ICON = "tpl_info.png"
 WX_MARK_1 = "tpl_da_zhao_hu.png"
@@ -281,7 +282,8 @@ def main():
         "info_icon": load_template(base / INFO_ICON),
         "wx1": load_template(base / WX_MARK_1),
         "wx2": load_template(base / WX_MARK_2),
-        "qq_mark": load_template(base / QQ_MARK),
+        "qq_mark1": load_template(base / QQ_MARK_1),
+        "qq_mark2": load_template(base / QQ_MARK_2),
         "close": load_template(base / CLOSE_BUTTON),
     }
 
@@ -349,8 +351,9 @@ def main():
             time.sleep(2.0)
             # 6. 检测到 QQ 标记时按需求判断为“微信可用”，否则“QQ可用”。
             profile = adb.screenshot()
-            qq = match_best(profile, templ["qq_mark"], args.threshold)
-            if qq:
+            qq1 = match_best(profile, templ["qq_mark1"], args.threshold)
+            qq2 = match_best(profile, templ["qq_mark2"], args.threshold)
+            if qq1 or qq2:
                 update_type(db_path, row_id, AccountType.WX)
                 print(f"{game_id}: 微信可用")
             else:
