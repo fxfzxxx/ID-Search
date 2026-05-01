@@ -13,13 +13,13 @@ import numpy as np
 
 DB_NAME = "input.db"
 
-SEARCH_INPUT = "tpl1777538707312.png"
-SEARCH_BUTTON = "tpl1777535669662.png"
-RESULT_CARD = "tpl1777535410888.png"
-OPEN_CARD = "tpl1777536126935.png"
-WX_MARK_1 = "tpl1777534267289.png"
-WX_MARK_2 = "tpl1777548253105.png"
-CLOSE_BUTTON = "tpl1777536316927.png"
+SEARCH_INPUT = "tpl_shu_ru.png"
+SEARCH_BUTTON = "tpl_search_btn.png"
+RESULT_CARD = "tpl_add_friend.png"
+OPEN_CARD = "tpl_info.png"
+WX_MARK_1 = "tpl_da_zhao_hu.png"
+WX_MARK_2 = "tpl_wx_ming_pian.png"
+CLOSE_BUTTON = "tpl_close.png"
 
 
 def parse_device_uri(uri: str):
