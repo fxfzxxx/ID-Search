@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from enum import Enum
 
 import cv2
 import numpy as np
@@ -15,11 +16,19 @@ DB_NAME = "input.db"
 
 SEARCH_INPUT = "tpl_shu_ru.png"
 SEARCH_BUTTON = "tpl_search_btn.png"
-RESULT_CARD = "tpl_add_friend.png"
-OPEN_CARD = "tpl_info.png"
+QQ_MARK = "tpl_qq_ming_pian.png"
+ADD_FRIEND_ICON = "tpl_add_friend.png"
+INFO_ICON = "tpl_info.png"
 WX_MARK_1 = "tpl_da_zhao_hu.png"
 WX_MARK_2 = "tpl_wx_ming_pian.png"
 CLOSE_BUTTON = "tpl_close.png"
+
+
+class AccountType(str, Enum):
+    QQ = "qq"
+    WX = "wx"
+    BOTH = "both"
+    NONE = "none"
 
 
 def parse_device_uri(uri: str):
@@ -215,11 +224,12 @@ def load_rows(db_path: Path):
         conn.close()
 
 
-def update_type(db_path: Path, row_id: int, value: str):
+def update_type(db_path: Path, row_id: int, value: AccountType | str):
+    db_value = value.value if isinstance(value, AccountType) else str(value)
     conn = sqlite3.connect(str(db_path))
     try:
         cur = conn.cursor()
-        cur.execute("UPDATE words SET type = ? WHERE id = ?", (value, row_id))
+        cur.execute("UPDATE words SET type = ? WHERE id = ?", (db_value, row_id))
         conn.commit()
     finally:
         conn.close()
@@ -246,10 +256,11 @@ def main():
     templ = {
         "search_input": load_template(base / SEARCH_INPUT),
         "search_button": load_template(base / SEARCH_BUTTON),
-        "result_card": load_template(base / RESULT_CARD),
-        "open_card": load_template(base / OPEN_CARD),
+        "add_friend_icon": load_template(base / ADD_FRIEND_ICON),
+        "info_icon": load_template(base / INFO_ICON),
         "wx1": load_template(base / WX_MARK_1),
         "wx2": load_template(base / WX_MARK_2),
+        "qq_mark": load_template(base / QQ_MARK),
         "close": load_template(base / CLOSE_BUTTON),
     }
 
@@ -260,18 +271,20 @@ def main():
     for idx, (row_id, game_id) in enumerate(rows, start=1):
         try:
             print(f"[{idx}/{len(rows)}] search: id={row_id}, content={game_id}")
-
+            # 1. 先找搜索输入框，避免界面异常导致后续步骤都找不到元素。
             hit, _ = wait_template(
                 adb, templ["search_input"], threshold=args.threshold, timeout=20
             )
             if not hit:
                 print(f"skip {game_id}: search input not found")
                 continue
+            # 2. 点击输入框
             adb.tap(hit[0], hit[1])
             time.sleep(0.3)
+            # 3. 清空并输入游戏ID
             adb.clear_text_field()
             adb.text(str(game_id))
-
+            # 4. 点击搜索按钮
             hit_btn, _ = wait_template(
                 adb, templ["search_button"], threshold=args.threshold, timeout=5
             )
@@ -282,10 +295,12 @@ def main():
             time.sleep(2.0)
 
             screen = adb.screenshot()
+            # 5. 匹配结果卡片, 这里找的是每个结果的“添加好友”按钮。
             cards = match_all(
-                screen, templ["result_card"], args.threshold, min_distance=50
+                screen, templ["add_friend_icon"], args.threshold, min_distance=50
             )
-            if len(cards) != 2:
+            # 只有识别到 1 个结果卡片时才继续；0 个或 2 个及以上都跳过。
+            if len(cards) != 1:
                 print(f"skip {game_id}: result cards={len(cards)}")
                 continue
 
@@ -293,20 +308,18 @@ def main():
             adb.tap(int(w * 0.1), int(h * 0.5))
             time.sleep(1.5)
 
-            hit_open, _ = wait_template(
-                adb, templ["open_card"], threshold=args.threshold, timeout=5
+            hit_info, _ = wait_template(
+                adb, templ["info_icon"], threshold=args.threshold, timeout=5
             )
-            if not hit_open:
-                print(f"skip {game_id}: open card button not found")
+            if not hit_info:
+                print(f"skip {game_id}: info icon not found")
                 continue
-            adb.tap(hit_open[0], hit_open[1])
+            adb.tap(hit_info[0], hit_info[1])
             time.sleep(2.0)
-
+            # 6.如果有qq名片就是qq区，不然就是微信区
             profile = adb.screenshot()
-            wx = match_best(profile, templ["wx1"], args.threshold) or match_best(
-                profile, templ["wx2"], args.threshold
-            )
-            update_type(db_path, row_id, "wx" if wx else "qq")
+            qq = match_best(profile, templ["qq_mark"], args.threshold)
+            update_type(db_path, row_id, AccountType.QQ if qq else AccountType.WX)
 
             hit_close, _ = wait_template(
                 adb, templ["close"], threshold=args.threshold, timeout=5
