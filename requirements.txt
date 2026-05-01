@@ -1,0 +1,3 @@
+airtest
+numpy
+opencv-python-headless
