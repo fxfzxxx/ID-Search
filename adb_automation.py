@@ -228,7 +228,32 @@ def wait_template(adb: AdbClient, templ, threshold=0.55, timeout=20.0, interval=
     return None, None
 
 
-def load_rows(db_path: Path):
+def parse_id_list(text: str):
+    ids = []
+    for part in text.split(","):
+        raw = part.strip()
+        if not raw:
+            continue
+        if not raw.isdigit():
+            raise ValueError(f"Invalid id: {raw}")
+        ids.append(int(raw))
+    return ids
+
+
+def load_ids_from_file(path: Path):
+    ids = []
+    content = path.read_text(encoding="utf-8")
+    for line in content.splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        if not raw.isdigit():
+            raise ValueError(f"Invalid id in file {path}: {raw}")
+        ids.append(int(raw))
+    return ids
+
+
+def load_rows(db_path: Path, only_ids=None):
     conn = sqlite3.connect(str(db_path))
     try:
         cur = conn.cursor()
@@ -240,7 +265,14 @@ def load_rows(db_path: Path):
             ")"
         )
         conn.commit()
-        cur.execute("SELECT id, content FROM words WHERE content <> '' ORDER BY id")
+        if only_ids:
+            placeholders = ",".join("?" for _ in only_ids)
+            cur.execute(
+                f"SELECT id, content FROM words WHERE content <> '' AND id IN ({placeholders}) ORDER BY id",
+                tuple(only_ids),
+            )
+        else:
+            cur.execute("SELECT id, content FROM words WHERE content <> '' ORDER BY id")
         return cur.fetchall()
     finally:
         conn.close()
@@ -267,6 +299,16 @@ def main():
     parser.add_argument("--db", default=DB_NAME)
     parser.add_argument("--threshold", type=float, default=0.55)
     parser.add_argument("--limit", type=int, default=0, help="0 means no limit")
+    parser.add_argument(
+        "--ids",
+        default="",
+        help="Comma-separated row IDs to process, e.g. 1,2,3",
+    )
+    parser.add_argument(
+        "--ids-file",
+        default="",
+        help="Text file with one row ID per line",
+    )
     args = parser.parse_args()
 
     port, serial = parse_device_uri(args.device)
@@ -287,7 +329,16 @@ def main():
         "close": load_template(base / CLOSE_BUTTON),
     }
 
-    rows = load_rows(db_path)
+    assigned_ids = []
+    if args.ids.strip():
+        assigned_ids.extend(parse_id_list(args.ids))
+    if args.ids_file.strip():
+        assigned_ids.extend(load_ids_from_file(Path(args.ids_file)))
+    if assigned_ids:
+        # Keep order while removing duplicates.
+        assigned_ids = list(dict.fromkeys(assigned_ids))
+
+    rows = load_rows(db_path, only_ids=assigned_ids)
     if args.limit > 0:
         rows = rows[: args.limit]
 
