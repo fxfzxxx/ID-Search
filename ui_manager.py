@@ -1,5 +1,6 @@
 import json
 import queue
+import re
 import sqlite3
 import subprocess
 import sys
@@ -18,6 +19,7 @@ class ProcessInfo:
     started_at: float
     assigned_count: int
     ids_file: Path
+    queried_count: int = 0
 
 
 TYPE_LABEL_MAP = {
@@ -40,12 +42,10 @@ class AutomationUI(tk.Tk):
         self.base_dir = Path(__file__).resolve().parent
         self.ids_dir = self.base_dir / "_assigned_ids"
         self.ids_dir.mkdir(parents=True, exist_ok=True)
-        self.cooldown_path = self.base_dir / ".device_cooldown.json"
 
         self.db_name_var = tk.StringVar(value="input.db")
         self.threshold_var = tk.StringVar(value="0.55")
         self.batch_size_var = tk.IntVar(value=60)
-        self.cooldown_minutes_var = tk.IntVar(value=90)
         self.only_untyped_var = tk.BooleanVar(value=True)
         self.only_q_var = tk.BooleanVar(value=False)
         self.only_w_var = tk.BooleanVar(value=False)
@@ -68,7 +68,6 @@ class AutomationUI(tk.Tk):
         self.log_queue = queue.Queue()
         self.devices = []
         self.processes = {}
-        self.cooldowns = self._load_cooldowns()
 
         self._build_ui()
         self._refresh_devices()
@@ -93,11 +92,6 @@ class AutomationUI(tk.Tk):
         ttk.Label(top, text="每设备条数").grid(row=0, column=4, sticky="w", padx=(0, 6))
         ttk.Entry(top, textvariable=self.batch_size_var, width=8).grid(
             row=0, column=5, sticky="w", padx=(0, 10)
-        )
-
-        ttk.Label(top, text="冷却(分钟)").grid(row=0, column=6, sticky="w", padx=(0, 6))
-        ttk.Entry(top, textvariable=self.cooldown_minutes_var, width=8).grid(
-            row=0, column=7, sticky="w", padx=(0, 10)
         )
 
         btn_row = ttk.Frame(self, padding=(10, 0, 10, 10))
@@ -142,7 +136,7 @@ class AutomationUI(tk.Tk):
 
         self.device_tree = ttk.Treeview(
             left,
-            columns=("serial", "state", "cooldown", "assigned", "process"),
+            columns=("serial", "state", "queried", "assigned", "process"),
             show="headings",
             height=14,
             selectmode="extended",
@@ -150,7 +144,7 @@ class AutomationUI(tk.Tk):
         for col, title, width in (
             ("serial", "设备序列号", 210),
             ("state", "状态", 100),
-            ("cooldown", "冷却", 100),
+            ("queried", "已查询", 100),
             ("assigned", "分配数", 90),
             ("process", "进程", 100),
         ):
@@ -506,43 +500,6 @@ class AutomationUI(tk.Tk):
             devices.append({"serial": serial, "state": state, "raw": raw})
         return devices
 
-    def _load_cooldowns(self):
-        if not self.cooldown_path.exists():
-            return {}
-        try:
-            data = json.loads(self.cooldown_path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                return {}
-            cleaned = {}
-            now = time.time()
-            for serial, until in data.items():
-                try:
-                    value = float(until)
-                except (TypeError, ValueError):
-                    continue
-                if value > now:
-                    cleaned[str(serial)] = value
-            return cleaned
-        except Exception:
-            return {}
-
-    def _save_cooldowns(self):
-        self.cooldown_path.write_text(
-            json.dumps(self.cooldowns, ensure_ascii=True, indent=2), encoding="utf-8"
-        )
-
-    def _format_cooldown(self, serial: str):
-        if serial in self.processes:
-            return "运行中"
-        until = self.cooldowns.get(serial, 0)
-        remain = int(until - time.time())
-        if remain <= 0:
-            return "-"
-        h = remain // 3600
-        m = (remain % 3600) // 60
-        s = remain % 60
-        return f"{h:02d}:{m:02d}:{s:02d}"
-
     def _refresh_devices(self):
         self._set_loading("正在刷新设备列表...")
         try:
@@ -640,6 +597,7 @@ class AutomationUI(tk.Tk):
         for dev in self.devices:
             serial = dev["serial"]
             proc_info = self.processes.get(serial)
+            queried = proc_info.queried_count if proc_info else 0
             assigned = proc_info.assigned_count if proc_info else 0
             proc_state = "运行中" if proc_info else "空闲"
             self.device_tree.insert(
@@ -648,7 +606,7 @@ class AutomationUI(tk.Tk):
                 values=(
                     serial,
                     dev["state"],
-                    self._format_cooldown(serial),
+                    queried,
                     assigned,
                     proc_state,
                 ),
@@ -692,6 +650,32 @@ class AutomationUI(tk.Tk):
     def _chunk(self, rows, size: int):
         return [rows[i : i + size] for i in range(0, len(rows), size)]
 
+    def _distribute_rows(self, rows, devices, per_device_limit: int):
+        if not rows or not devices or per_device_limit <= 0:
+            return []
+
+        buckets = {dev["serial"]: [] for dev in devices}
+        serial_order = [dev["serial"] for dev in devices]
+
+        # Round-robin assignment makes sure selected devices can all get work first.
+        idx = 0
+        for row in rows:
+            checked = 0
+            while checked < len(serial_order):
+                serial = serial_order[idx % len(serial_order)]
+                idx += 1
+                checked += 1
+                if len(buckets[serial]) < per_device_limit:
+                    buckets[serial].append(row)
+                    break
+
+        assignments = []
+        for dev in devices:
+            chunk = buckets[dev["serial"]]
+            if chunk:
+                assignments.append((dev, chunk))
+        return assignments
+
     def _start_tasks(self):
         self._set_loading("正在准备任务并启动脚本...")
         try:
@@ -725,10 +709,9 @@ class AutomationUI(tk.Tk):
                 d
                 for d in online_devices
                 if d["serial"] not in self.processes
-                and self.cooldowns.get(d["serial"], 0) <= now
             ]
             if not available:
-                messagebox.showinfo("无可用设备", "没有可用设备（需在线且不在冷却中）")
+                messagebox.showinfo("无可用设备", "没有可用设备（需在线且未在运行）")
                 return
 
             batch_size = int(self.batch_size_var.get())
@@ -738,11 +721,15 @@ class AutomationUI(tk.Tk):
                 messagebox.showinfo("无可分配数据", "没有 type 为空的数据可分配")
                 return
 
-            chunks = self._chunk(rows, batch_size)
-            assignments = list(zip(available, chunks))
+            assignments = self._distribute_rows(rows, available, batch_size)
             if not assignments:
                 messagebox.showinfo("无分配结果", "没有生成有效的数据分片")
                 return
+
+            if len(assignments) < len(available):
+                self._append_log(
+                    f"提示: 可用设备 {len(available)} 台，实际启动 {len(assignments)} 台（数据不足或设备受限）"
+                )
 
             script_path = self.base_dir / "adb_automation.py"
             db_name = self.db_name_var.get().strip()
@@ -784,6 +771,7 @@ class AutomationUI(tk.Tk):
                     started_at=time.time(),
                     assigned_count=len(chunk),
                     ids_file=ids_file,
+                    queried_count=0,
                 )
                 thread = threading.Thread(
                     target=self._stream_process_output,
@@ -802,9 +790,15 @@ class AutomationUI(tk.Tk):
     def _stream_process_output(self, serial: str, proc: subprocess.Popen):
         if proc.stdout is None:
             return
+        progress_re = re.compile(r"^\[(\d+)/(\d+)\]\s+search:")
         for line in iter(proc.stdout.readline, ""):
             text = line.strip()
             if text:
+                m = progress_re.match(text)
+                if m:
+                    info = self.processes.get(serial)
+                    if info is not None:
+                        info.queried_count = int(m.group(1))
                 self.log_queue.put(f"[{serial}] {text}")
 
     def _stop_tasks(self):
@@ -825,11 +819,6 @@ class AutomationUI(tk.Tk):
                 info.process.kill()
                 self._append_log(f"已强制结束 {serial}")
 
-    def _mark_cooldown(self, serial: str):
-        cooldown_seconds = int(self.cooldown_minutes_var.get()) * 60
-        self.cooldowns[serial] = time.time() + cooldown_seconds
-        self._save_cooldowns()
-
     def _poll_events(self):
         while not self.log_queue.empty():
             msg = self.log_queue.get_nowait()
@@ -842,7 +831,6 @@ class AutomationUI(tk.Tk):
                 continue
             changed = True
             self._append_log(f"完成 {serial}: 退出码={code}")
-            self._mark_cooldown(serial)
             try:
                 if info.ids_file.exists():
                     info.ids_file.unlink()
