@@ -33,6 +33,8 @@ TYPE_LABEL_MAP = {
     "wx": "微信可用",
 }
 
+DEFAULT_DEVICE_QUERY_LIMIT = 60
+
 
 class AutomationUI(tk.Tk):
     def __init__(self):
@@ -43,10 +45,11 @@ class AutomationUI(tk.Tk):
         self.base_dir = Path(__file__).resolve().parent
         self.ids_dir = self.base_dir / "_assigned_ids"
         self.ids_dir.mkdir(parents=True, exist_ok=True)
+        self.device_usage_path = self.base_dir / ".device_query_usage.json"
 
         self.db_name_var = tk.StringVar(value="input.db")
-        self.threshold_var = tk.StringVar(value="0.55")
-        self.batch_size_var = tk.IntVar(value=60)
+        self.threshold_var = tk.StringVar(value="0.8")
+        self.batch_size_var = tk.IntVar(value=DEFAULT_DEVICE_QUERY_LIMIT)
         self.only_untyped_var = tk.BooleanVar(value=True)
         self.only_q_var = tk.BooleanVar(value=False)
         self.only_w_var = tk.BooleanVar(value=False)
@@ -65,10 +68,12 @@ class AutomationUI(tk.Tk):
         self.loading_tick_after_id = None
         self.loading_force_until = 0.0
         self.loading_current_message = ""
+        self.limit_hint_var = tk.StringVar(value="")
 
         self.log_queue = queue.Queue()
         self.devices = []
         self.processes = {}
+        self.device_usage = self._load_device_usage()
 
         self._build_ui()
         self._refresh_devices()
@@ -90,7 +95,7 @@ class AutomationUI(tk.Tk):
             row=0, column=3, sticky="w", padx=(0, 10)
         )
 
-        ttk.Label(top, text="每设备条数").grid(row=0, column=4, sticky="w", padx=(0, 6))
+        ttk.Label(top, text="每设备上限").grid(row=0, column=4, sticky="w", padx=(0, 6))
         ttk.Entry(top, textvariable=self.batch_size_var, width=8).grid(
             row=0, column=5, sticky="w", padx=(0, 10)
         )
@@ -156,6 +161,17 @@ class AutomationUI(tk.Tk):
             left,
             text="提示：按住 Ctrl 可多选设备；点击开始时仅分配给选中的设备。",
         ).pack(anchor="w", padx=8, pady=(0, 8))
+        device_action_row = ttk.Frame(left, padding=(8, 0, 8, 8))
+        device_action_row.pack(fill=tk.X)
+        ttk.Button(
+            device_action_row,
+            text="换号(重置选中设备)",
+            command=self._reset_selected_devices_quota,
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            device_action_row,
+            textvariable=self.limit_hint_var,
+        ).pack(side=tk.LEFT, padx=(10, 0))
 
         db_filter = ttk.Frame(right, padding=(8, 6, 8, 0))
         db_filter.pack(fill=tk.X)
@@ -256,6 +272,9 @@ class AutomationUI(tk.Tk):
         log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         self.log_text = tk.Text(log_frame, height=14, wrap="word")
         self.log_text.pack(fill=tk.BOTH, expand=True)
+
+        self._update_limit_hint()
+        self.batch_size_var.trace_add("write", lambda *_args: self._update_limit_hint())
 
     def _append_log(self, message: str):
         ts = time.strftime("%H:%M:%S")
@@ -384,6 +403,46 @@ class AutomationUI(tk.Tk):
 
     def _db_path(self) -> Path:
         return self.base_dir / self.db_name_var.get().strip()
+
+    def _device_query_limit(self):
+        try:
+            value = int(self.batch_size_var.get())
+        except Exception:
+            return DEFAULT_DEVICE_QUERY_LIMIT
+        return max(1, value)
+
+    def _update_limit_hint(self):
+        limit = self._device_query_limit()
+        self.limit_hint_var.set(f"提示：已查询达到 {limit} 次后，需要换号")
+
+    def _load_device_usage(self):
+        if not self.device_usage_path.exists():
+            return {}
+        try:
+            data = json.loads(self.device_usage_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return {}
+            out = {}
+            for serial, count in data.items():
+                try:
+                    value = int(count)
+                except (TypeError, ValueError):
+                    continue
+                out[str(serial)] = max(0, value)
+            return out
+        except Exception:
+            return {}
+
+    def _save_device_usage(self):
+        self.device_usage_path.write_text(
+            json.dumps(self.device_usage, ensure_ascii=True, indent=2),
+            encoding="utf-8",
+        )
+
+    def _remaining_quota(self, serial: str):
+        limit = self._device_query_limit()
+        used = int(self.device_usage.get(serial, 0))
+        return max(0, limit - used)
 
     def _ensure_words_table(self):
         db_path = self._db_path()
@@ -602,7 +661,11 @@ class AutomationUI(tk.Tk):
         for dev in self.devices:
             serial = dev["serial"]
             proc_info = self.processes.get(serial)
-            queried = proc_info.queried_count if proc_info else 0
+            limit = self._device_query_limit()
+            queried = int(self.device_usage.get(serial, 0))
+            if proc_info:
+                queried += proc_info.queried_count
+            queried = min(limit, queried)
             assigned = proc_info.assigned_count if proc_info else 0
             proc_state = "运行中" if proc_info else "空闲"
             self.device_tree.insert(
@@ -655,12 +718,18 @@ class AutomationUI(tk.Tk):
     def _chunk(self, rows, size: int):
         return [rows[i : i + size] for i in range(0, len(rows), size)]
 
-    def _distribute_rows(self, rows, devices, per_device_limit: int):
-        if not rows or not devices or per_device_limit <= 0:
+    def _distribute_rows(self, rows, devices, capacity_by_serial: dict):
+        if not rows or not devices:
             return []
 
         buckets = {dev["serial"]: [] for dev in devices}
-        serial_order = [dev["serial"] for dev in devices]
+        serial_order = [
+            dev["serial"]
+            for dev in devices
+            if int(capacity_by_serial.get(dev["serial"], 0)) > 0
+        ]
+        if not serial_order:
+            return []
 
         # Round-robin assignment makes sure selected devices can all get work first.
         idx = 0
@@ -670,7 +739,7 @@ class AutomationUI(tk.Tk):
                 serial = serial_order[idx % len(serial_order)]
                 idx += 1
                 checked += 1
-                if len(buckets[serial]) < per_device_limit:
+                if len(buckets[serial]) < int(capacity_by_serial.get(serial, 0)):
                     buckets[serial].append(row)
                     break
 
@@ -681,6 +750,28 @@ class AutomationUI(tk.Tk):
                 assignments.append((dev, chunk))
         return assignments
 
+    def _reset_selected_devices_quota(self):
+        selected = self._selected_device_serials()
+        if not selected:
+            messagebox.showinfo("提示", "请先选择要换号的设备")
+            return
+
+        running = [serial for serial in selected if serial in self.processes]
+        if running:
+            messagebox.showwarning(
+                "操作受限",
+                f"以下设备正在运行，不能重置：{', '.join(running)}",
+            )
+            return
+
+        for serial in selected:
+            self.device_usage[serial] = 0
+            self._append_log(
+                f"换号 {serial}: 已重置可查询次数上限为 {self._device_query_limit()}"
+            )
+        self._save_device_usage()
+        self._render_device_tree()
+
     def _start_tasks(self):
         self._set_loading("正在准备任务并启动脚本...")
         try:
@@ -688,7 +779,8 @@ class AutomationUI(tk.Tk):
                 messagebox.showwarning("忙碌", "当前仍有任务在运行")
                 return
 
-            if self.batch_size_var.get() <= 0:
+            limit = self._device_query_limit()
+            if limit <= 0:
                 messagebox.showwarning("配置错误", "每设备条数必须大于 0")
                 return
 
@@ -715,14 +807,26 @@ class AutomationUI(tk.Tk):
                 messagebox.showinfo("无可用设备", "没有可用设备（需在线且未在运行）")
                 return
 
-            batch_size = int(self.batch_size_var.get())
-            wanted = len(available) * batch_size
+            per_device_capacity = {
+                dev["serial"]: self._remaining_quota(dev["serial"]) for dev in available
+            }
+            available = [
+                dev for dev in available if per_device_capacity.get(dev["serial"], 0) > 0
+            ]
+            if not available:
+                messagebox.showinfo(
+                    "无可用设备",
+                    f"所选设备已达到 {limit} 次上限，请点击换号后重试",
+                )
+                return
+
+            wanted = sum(per_device_capacity.get(dev["serial"], 0) for dev in available)
             rows = self._fetch_untyped_for_assign(wanted)
             if not rows:
                 messagebox.showinfo("无可分配数据", "没有 type 为空的数据可分配")
                 return
 
-            assignments = self._distribute_rows(rows, available, batch_size)
+            assignments = self._distribute_rows(rows, available, per_device_capacity)
             if not assignments:
                 messagebox.showinfo("无分配结果", "没有生成有效的数据分片")
                 return
@@ -834,12 +938,20 @@ class AutomationUI(tk.Tk):
                 continue
             changed = True
             self._append_log(f"完成 {serial}: 退出码={code}")
+            used = int(self.device_usage.get(serial, 0))
+            self.device_usage[serial] = min(
+                self._device_query_limit(),
+                used + int(info.queried_count),
+            )
             try:
                 if info.ids_file.exists():
                     info.ids_file.unlink()
             except Exception:
                 pass
             del self.processes[serial]
+
+        if changed:
+            self._save_device_usage()
 
         if changed:
             self._refresh_devices()
