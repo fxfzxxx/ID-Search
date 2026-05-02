@@ -1,4 +1,5 @@
 import json
+import os
 import queue
 import re
 import sqlite3
@@ -423,9 +424,13 @@ class AutomationUI(tk.Tk):
             if only_untyped:
                 type_filters.append("(type IS NULL OR TRIM(type) = '')")
             if only_q:
-                type_filters.append("LOWER(COALESCE(type, '')) IN ('qq available', 'qq')")
+                type_filters.append(
+                    "LOWER(COALESCE(type, '')) IN ('qq available', 'qq')"
+                )
             if only_w:
-                type_filters.append("LOWER(COALESCE(type, '')) IN ('wx available', 'wx')")
+                type_filters.append(
+                    "LOWER(COALESCE(type, '')) IN ('wx available', 'wx')"
+                )
             if only_both:
                 type_filters.append("LOWER(COALESCE(type, '')) = 'both available'")
             if type_filters:
@@ -705,11 +710,7 @@ class AutomationUI(tk.Tk):
                     return
 
             now = time.time()
-            available = [
-                d
-                for d in online_devices
-                if d["serial"] not in self.processes
-            ]
+            available = [d for d in online_devices if d["serial"] not in self.processes]
             if not available:
                 messagebox.showinfo("无可用设备", "没有可用设备（需在线且未在运行）")
                 return
@@ -744,6 +745,7 @@ class AutomationUI(tk.Tk):
 
                 cmd = [
                     sys.executable,
+                    "-u",
                     str(script_path),
                     "--device",
                     serial,
@@ -757,6 +759,7 @@ class AutomationUI(tk.Tk):
                 proc = subprocess.Popen(
                     cmd,
                     cwd=str(self.base_dir),
+                    env={**os.environ, "PYTHONUNBUFFERED": "1"},
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
