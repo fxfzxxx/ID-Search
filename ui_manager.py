@@ -47,6 +47,9 @@ class AutomationUI(tk.Tk):
         self.batch_size_var = tk.IntVar(value=60)
         self.cooldown_minutes_var = tk.IntVar(value=90)
         self.only_untyped_var = tk.BooleanVar(value=True)
+        self.only_q_var = tk.BooleanVar(value=False)
+        self.only_w_var = tk.BooleanVar(value=False)
+        self.only_both_var = tk.BooleanVar(value=False)
         self.search_var = tk.StringVar(value="")
         self.page_size_var = tk.IntVar(value=100)
         self.page_info_var = tk.StringVar(value="第 1/1 页")
@@ -54,6 +57,13 @@ class AutomationUI(tk.Tk):
         self.current_page = 1
         self.total_filtered_rows = 0
         self.total_pages = 1
+        self.loading_depth = 0
+        self.loading_started_at = 0.0
+        self.loading_finish_after_id = None
+        self.loading_hide_after_id = None
+        self.loading_tick_after_id = None
+        self.loading_force_until = 0.0
+        self.loading_current_message = ""
 
         self.log_queue = queue.Queue()
         self.devices = []
@@ -106,6 +116,22 @@ class AutomationUI(tk.Tk):
 
         ttk.Label(btn_row, textvariable=self.stats_var).pack(side=tk.RIGHT)
 
+        self.loading_text_var = tk.StringVar(value="")
+        self.loading_row = ttk.Frame(self, padding=(10, 0, 10, 8))
+        self.loading_row.configure(height=26)
+        self.loading_row.pack_propagate(False)
+        self.loading_label = ttk.Label(
+            self.loading_row, textvariable=self.loading_text_var
+        )
+        self.loading_label.pack(side=tk.LEFT, padx=(0, 8))
+        self.loading_bar = ttk.Progressbar(
+            self.loading_row,
+            mode="determinate",
+            length=260,
+            maximum=100,
+        )
+        self.loading_row.pack(side=tk.BOTTOM, fill=tk.X)
+
         panes = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
         panes.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
@@ -155,7 +181,9 @@ class AutomationUI(tk.Tk):
             values=(50, 100, 200, 500),
         )
         page_size_combo.pack(side=tk.LEFT, padx=(6, 6))
-        page_size_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_page_size_changed())
+        page_size_combo.bind(
+            "<<ComboboxSelected>>", lambda _e: self._on_page_size_changed()
+        )
 
         ttk.Button(db_filter, text="下一页", command=self._next_page).pack(
             side=tk.RIGHT, padx=(8, 0)
@@ -171,6 +199,24 @@ class AutomationUI(tk.Tk):
             db_filter_extra,
             text="仅显示未处理(type为空)",
             variable=self.only_untyped_var,
+            command=self._on_filter_changed,
+        ).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(
+            db_filter_extra,
+            text="Q区可用",
+            variable=self.only_q_var,
+            command=self._on_filter_changed,
+        ).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(
+            db_filter_extra,
+            text="W区可用",
+            variable=self.only_w_var,
+            command=self._on_filter_changed,
+        ).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(
+            db_filter_extra,
+            text="双区可用",
+            variable=self.only_both_var,
             command=self._on_filter_changed,
         ).pack(side=tk.LEFT)
 
@@ -201,7 +247,9 @@ class AutomationUI(tk.Tk):
             orient="horizontal",
             command=self.db_tree.xview,
         )
-        self.db_tree.configure(yscrollcommand=db_scroll_y.set, xscrollcommand=db_scroll_x.set)
+        self.db_tree.configure(
+            yscrollcommand=db_scroll_y.set, xscrollcommand=db_scroll_x.set
+        )
 
         self.db_tree.grid(row=0, column=0, sticky="nsew")
         db_scroll_y.grid(row=0, column=1, sticky="ns")
@@ -218,6 +266,120 @@ class AutomationUI(tk.Tk):
         ts = time.strftime("%H:%M:%S")
         self.log_text.insert(tk.END, f"[{ts}] {message}\n")
         self.log_text.see(tk.END)
+
+    def _set_loading(self, message: str):
+        if self.loading_finish_after_id is not None:
+            try:
+                self.after_cancel(self.loading_finish_after_id)
+            except Exception:
+                pass
+            self.loading_finish_after_id = None
+        if self.loading_hide_after_id is not None:
+            try:
+                self.after_cancel(self.loading_hide_after_id)
+            except Exception:
+                pass
+            self.loading_hide_after_id = None
+
+        self.loading_depth += 1
+        self.loading_current_message = message
+        self.loading_text_var.set(message)
+        if self.loading_depth == 1:
+            self.loading_started_at = time.time()
+            self.loading_force_until = 0.0
+            self.loading_bar.configure(value=0)
+            if not self.loading_bar.winfo_ismapped():
+                self.loading_bar.pack(side=tk.LEFT)
+            self._schedule_loading_tick()
+        self.update_idletasks()
+
+    def _clear_loading(self):
+        if self.loading_depth > 0:
+            self.loading_depth -= 1
+        if self.loading_depth > 0:
+            self.update_idletasks()
+            return
+
+        elapsed = max(0.0, time.time() - self.loading_started_at)
+        remain = max(0.0, 1.5 - elapsed)
+        if remain > 0:
+            self.loading_force_until = self.loading_started_at + 1.5
+            self._schedule_loading_tick()
+            self.loading_finish_after_id = self.after(
+                int(remain * 1000), self._finish_loading_ui
+            )
+            return
+        self._finish_loading_ui()
+
+    def _done_message(self, loading_message: str):
+        msg = (loading_message or "").strip()
+        if not msg:
+            return "操作已完成"
+        msg = msg.replace("...", "").replace("…", "")
+        if msg.startswith("正在"):
+            msg = msg[2:]
+        return f"{msg}已完成"
+
+    def _schedule_loading_tick(self):
+        if self.loading_tick_after_id is not None:
+            return
+        self.loading_tick_after_id = self.after(33, self._tick_loading_bar)
+
+    def _loading_curve(self, elapsed: float, total: float, cap: float):
+        if total <= 0:
+            return cap
+        t = max(0.0, min(1.0, elapsed / total))
+        # Front 80% faster, last 20% slower.
+        if t <= 0.4:
+            mapped = (t / 0.4) * 0.8
+        else:
+            mapped = 0.8 + ((t - 0.4) / 0.6) * 0.2
+        return min(cap, mapped * cap)
+
+    def _tick_loading_bar(self):
+        self.loading_tick_after_id = None
+        now = time.time()
+        if self.loading_depth <= 0 and now >= self.loading_force_until:
+            return
+
+        elapsed = max(0.0, now - self.loading_started_at)
+        if self.loading_depth > 0:
+            # Keep a visible headroom during active loading.
+            progress = self._loading_curve(elapsed, total=1.5, cap=95.0)
+        else:
+            progress = self._loading_curve(elapsed, total=1.5, cap=100.0)
+        self.loading_bar.configure(value=progress)
+
+        if self.loading_depth > 0 or progress < 100.0:
+            self._schedule_loading_tick()
+
+    def _finish_loading_ui(self):
+        self.loading_finish_after_id = None
+        if self.loading_depth > 0:
+            return
+        self.loading_force_until = 0.0
+        if self.loading_tick_after_id is not None:
+            try:
+                self.after_cancel(self.loading_tick_after_id)
+            except Exception:
+                pass
+            self.loading_tick_after_id = None
+        self.loading_bar.configure(value=100)
+        if not self.loading_bar.winfo_ismapped():
+            self.loading_bar.pack(side=tk.LEFT)
+        self.loading_text_var.set(self._done_message(self.loading_current_message))
+        self.loading_hide_after_id = self.after(2000, self._hide_loading_ui)
+        self.update_idletasks()
+
+    def _hide_loading_ui(self):
+        self.loading_hide_after_id = None
+        if self.loading_depth > 0:
+            return
+        self.loading_bar.configure(value=0)
+        if self.loading_bar.winfo_ismapped():
+            self.loading_bar.pack_forget()
+        self.loading_text_var.set("")
+        self.update_idletasks()
 
     def _to_cn_type_label(self, raw_value: str):
         value = (raw_value or "").strip()
@@ -247,6 +409,9 @@ class AutomationUI(tk.Tk):
     def _fetch_db_rows(
         self,
         only_untyped: bool,
+        only_q: bool,
+        only_w: bool,
+        only_both: bool,
         keyword: str,
         page: int,
         page_size: int,
@@ -260,8 +425,18 @@ class AutomationUI(tk.Tk):
             base_where = ["content <> ''"]
             params = []
 
+            type_filters = []
             if only_untyped:
-                base_where.append("(type IS NULL OR TRIM(type) = '')")
+                type_filters.append("(type IS NULL OR TRIM(type) = '')")
+            if only_q:
+                type_filters.append("LOWER(COALESCE(type, '')) IN ('qq available', 'qq')")
+            if only_w:
+                type_filters.append("LOWER(COALESCE(type, '')) IN ('wx available', 'wx')")
+            if only_both:
+                type_filters.append("LOWER(COALESCE(type, '')) = 'both available'")
+            if type_filters:
+                base_where.append("(" + " OR ".join(type_filters) + ")")
+
             if kw:
                 base_where.append("(content LIKE ? OR COALESCE(type, '') LIKE ?)")
                 like_kw = f"%{kw}%"
@@ -369,55 +544,69 @@ class AutomationUI(tk.Tk):
         return f"{h:02d}:{m:02d}:{s:02d}"
 
     def _refresh_devices(self):
+        self._set_loading("正在刷新设备列表...")
         try:
-            self.devices = self._get_connected_devices()
-        except Exception as exc:
-            messagebox.showerror("ADB 错误", str(exc))
-            return
+            try:
+                self.devices = self._get_connected_devices()
+            except Exception as exc:
+                messagebox.showerror("ADB 错误", str(exc))
+                return
 
-        self._render_device_tree()
-        self._update_stats()
+            self._render_device_tree()
+            self._update_stats()
+        finally:
+            self._clear_loading()
 
     def _refresh_db(self):
-        page_size = max(int(self.page_size_var.get()), 1)
+        self._set_loading("正在加载数据库列表...")
         try:
-            rows, _, _, filtered_count = self._fetch_db_rows(
-                only_untyped=self.only_untyped_var.get(),
-                keyword=self.search_var.get(),
-                page=self.current_page,
-                page_size=page_size,
-            )
-        except Exception as exc:
-            messagebox.showerror("数据库错误", str(exc))
-            return
-
-        self.total_filtered_rows = filtered_count
-        self.total_pages = max((filtered_count + page_size - 1) // page_size, 1)
-        if self.current_page > self.total_pages:
-            self.current_page = self.total_pages
+            page_size = max(int(self.page_size_var.get()), 1)
             try:
                 rows, _, _, filtered_count = self._fetch_db_rows(
                     only_untyped=self.only_untyped_var.get(),
+                    only_q=self.only_q_var.get(),
+                    only_w=self.only_w_var.get(),
+                    only_both=self.only_both_var.get(),
                     keyword=self.search_var.get(),
                     page=self.current_page,
                     page_size=page_size,
                 )
-            except Exception:
-                rows = []
-            self.total_filtered_rows = filtered_count
-        self.page_info_var.set(
-            f"第 {self.current_page}/{self.total_pages} 页，共 {self.total_filtered_rows} 条"
-        )
+            except Exception as exc:
+                messagebox.showerror("数据库错误", str(exc))
+                return
 
-        for item in self.db_tree.get_children():
-            self.db_tree.delete(item)
-        for row_id, content, raw_type in rows:
-            self.db_tree.insert(
-                "",
-                tk.END,
-                values=(row_id, content, self._to_cn_type_label(raw_type)),
+            self.total_filtered_rows = filtered_count
+            self.total_pages = max((filtered_count + page_size - 1) // page_size, 1)
+            if self.current_page > self.total_pages:
+                self.current_page = self.total_pages
+                try:
+                    rows, _, _, filtered_count = self._fetch_db_rows(
+                        only_untyped=self.only_untyped_var.get(),
+                        only_q=self.only_q_var.get(),
+                        only_w=self.only_w_var.get(),
+                        only_both=self.only_both_var.get(),
+                        keyword=self.search_var.get(),
+                        page=self.current_page,
+                        page_size=page_size,
+                    )
+                except Exception:
+                    rows = []
+                self.total_filtered_rows = filtered_count
+            self.page_info_var.set(
+                f"第 {self.current_page}/{self.total_pages} 页，共 {self.total_filtered_rows} 条"
             )
-        self._update_stats()
+
+            for item in self.db_tree.get_children():
+                self.db_tree.delete(item)
+            for row_id, content, raw_type in rows:
+                self.db_tree.insert(
+                    "",
+                    tk.END,
+                    values=(row_id, content, self._to_cn_type_label(raw_type)),
+                )
+            self._update_stats()
+        finally:
+            self._clear_loading()
 
     def _search_db(self):
         self.current_page = 1
@@ -483,6 +672,9 @@ class AutomationUI(tk.Tk):
         try:
             _, total, untyped, _ = self._fetch_db_rows(
                 only_untyped=False,
+                only_q=False,
+                only_w=False,
+                only_both=False,
                 keyword="",
                 page=1,
                 page_size=1,
@@ -501,103 +693,111 @@ class AutomationUI(tk.Tk):
         return [rows[i : i + size] for i in range(0, len(rows), size)]
 
     def _start_tasks(self):
-        if self.processes:
-            messagebox.showwarning("忙碌", "当前仍有任务在运行")
-            return
-
-        if self.batch_size_var.get() <= 0:
-            messagebox.showwarning("配置错误", "每设备条数必须大于 0")
-            return
-
+        self._set_loading("正在准备任务并启动脚本...")
         try:
-            threshold = float(self.threshold_var.get())
-        except ValueError:
-            messagebox.showwarning("配置错误", "匹配阈值必须是数字")
-            return
-
-        selected_serials = set(self._selected_device_serials())
-        self._refresh_devices()
-        online_devices = [d for d in self.devices if d["state"] == "device"]
-        if selected_serials:
-            online_devices = [d for d in online_devices if d["serial"] in selected_serials]
-            if not online_devices:
-                messagebox.showinfo("无可用设备", "你选择的设备当前不在线")
+            if self.processes:
+                messagebox.showwarning("忙碌", "当前仍有任务在运行")
                 return
 
-        now = time.time()
-        available = [
-            d
-            for d in online_devices
-            if d["serial"] not in self.processes
-            and self.cooldowns.get(d["serial"], 0) <= now
-        ]
-        if not available:
-            messagebox.showinfo("无可用设备", "没有可用设备（需在线且不在冷却中）")
-            return
+            if self.batch_size_var.get() <= 0:
+                messagebox.showwarning("配置错误", "每设备条数必须大于 0")
+                return
 
-        batch_size = int(self.batch_size_var.get())
-        wanted = len(available) * batch_size
-        rows = self._fetch_untyped_for_assign(wanted)
-        if not rows:
-            messagebox.showinfo("无可分配数据", "没有 type 为空的数据可分配")
-            return
+            try:
+                threshold = float(self.threshold_var.get())
+            except ValueError:
+                messagebox.showwarning("配置错误", "匹配阈值必须是数字")
+                return
 
-        chunks = self._chunk(rows, batch_size)
-        assignments = list(zip(available, chunks))
-        if not assignments:
-            messagebox.showinfo("无分配结果", "没有生成有效的数据分片")
-            return
+            selected_serials = set(self._selected_device_serials())
+            self._refresh_devices()
+            online_devices = [d for d in self.devices if d["state"] == "device"]
+            if selected_serials:
+                online_devices = [
+                    d for d in online_devices if d["serial"] in selected_serials
+                ]
+                if not online_devices:
+                    messagebox.showinfo("无可用设备", "你选择的设备当前不在线")
+                    return
 
-        script_path = self.base_dir / "adb_automation.py"
-        db_name = self.db_name_var.get().strip()
-
-        for dev, chunk in assignments:
-            serial = dev["serial"]
-            ids = [str(r[0]) for r in chunk]
-            ids_file = self.ids_dir / f"{int(time.time())}_{serial.replace(':', '_')}.txt"
-            ids_file.write_text("\n".join(ids), encoding="utf-8")
-
-            cmd = [
-                sys.executable,
-                str(script_path),
-                "--device",
-                serial,
-                "--db",
-                db_name,
-                "--threshold",
-                f"{threshold}",
-                "--ids-file",
-                str(ids_file),
+            now = time.time()
+            available = [
+                d
+                for d in online_devices
+                if d["serial"] not in self.processes
+                and self.cooldowns.get(d["serial"], 0) <= now
             ]
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(self.base_dir),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="ignore",
-                bufsize=1,
-            )
+            if not available:
+                messagebox.showinfo("无可用设备", "没有可用设备（需在线且不在冷却中）")
+                return
 
-            self.processes[serial] = ProcessInfo(
-                serial=serial,
-                process=proc,
-                started_at=time.time(),
-                assigned_count=len(chunk),
-                ids_file=ids_file,
-            )
-            thread = threading.Thread(
-                target=self._stream_process_output,
-                args=(serial, proc),
-                daemon=True,
-            )
-            thread.start()
-            self._append_log(f"开始 {serial}: 分配 {len(chunk)} 条")
+            batch_size = int(self.batch_size_var.get())
+            wanted = len(available) * batch_size
+            rows = self._fetch_untyped_for_assign(wanted)
+            if not rows:
+                messagebox.showinfo("无可分配数据", "没有 type 为空的数据可分配")
+                return
 
-        self._render_device_tree()
-        self._update_stats()
-        self._refresh_db()
+            chunks = self._chunk(rows, batch_size)
+            assignments = list(zip(available, chunks))
+            if not assignments:
+                messagebox.showinfo("无分配结果", "没有生成有效的数据分片")
+                return
+
+            script_path = self.base_dir / "adb_automation.py"
+            db_name = self.db_name_var.get().strip()
+
+            for dev, chunk in assignments:
+                serial = dev["serial"]
+                ids = [str(r[0]) for r in chunk]
+                ids_file = (
+                    self.ids_dir / f"{int(time.time())}_{serial.replace(':', '_')}.txt"
+                )
+                ids_file.write_text("\n".join(ids), encoding="utf-8")
+
+                cmd = [
+                    sys.executable,
+                    str(script_path),
+                    "--device",
+                    serial,
+                    "--db",
+                    db_name,
+                    "--threshold",
+                    f"{threshold}",
+                    "--ids-file",
+                    str(ids_file),
+                ]
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(self.base_dir),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                    bufsize=1,
+                )
+
+                self.processes[serial] = ProcessInfo(
+                    serial=serial,
+                    process=proc,
+                    started_at=time.time(),
+                    assigned_count=len(chunk),
+                    ids_file=ids_file,
+                )
+                thread = threading.Thread(
+                    target=self._stream_process_output,
+                    args=(serial, proc),
+                    daemon=True,
+                )
+                thread.start()
+                self._append_log(f"开始 {serial}: 分配 {len(chunk)} 条")
+
+            self._render_device_tree()
+            self._update_stats()
+            self._refresh_db()
+        finally:
+            self._clear_loading()
 
     def _stream_process_output(self, serial: str, proc: subprocess.Popen):
         if proc.stdout is None:
