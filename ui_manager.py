@@ -811,7 +811,9 @@ class AutomationUI(tk.Tk):
                 dev["serial"]: self._remaining_quota(dev["serial"]) for dev in available
             }
             available = [
-                dev for dev in available if per_device_capacity.get(dev["serial"], 0) > 0
+                dev
+                for dev in available
+                if per_device_capacity.get(dev["serial"], 0) > 0
             ]
             if not available:
                 messagebox.showinfo(
